@@ -946,7 +946,8 @@ built_ota_tools := \
 	$(call intermediates-dir-for,EXECUTABLES,applypatch)/applypatch \
 	$(call intermediates-dir-for,EXECUTABLES,applypatch_static)/applypatch_static \
 	$(call intermediates-dir-for,EXECUTABLES,check_prereq)/check_prereq \
-	$(call intermediates-dir-for,EXECUTABLES,updater)/updater
+	$(call intermediates-dir-for,EXECUTABLES,updater)/updater \
+	$(call intermediates-dir-for,EXECUTABLES,bootcmdutil)/bootcmdutil
 
 $(BUILT_TARGET_FILES_PACKAGE): PRIVATE_OTA_TOOLS := $(built_ota_tools)
 
@@ -1114,6 +1115,8 @@ $(INTERNAL_OTA_PACKAGE_TARGET): $(BUILT_TARGET_FILES_PACKAGE) $(OTATOOLS)
 	$(hide) ./build/tools/releasetools/ota_from_target_files \
 	   -m $(scriptmode) \
 	   -p $(HOST_OUT) \
+	   $(if $(BUILD_TARGET_EXTRA_OTABOOT_INSTALL_SCRIPT), \
+	      --alt_boot_script=$(strip $(BUILD_TARGET_EXTRA_OTABOOT_INSTALL_SCRIPT)),) \
            -k $(KEY_CERT_PAIR) \
            --backup=$(backuptool) \
            --no_prereq=$(no_prereq) \

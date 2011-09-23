@@ -65,12 +65,21 @@ Usage:  ota_from_target_files [flags] input_target_files output_ota_package
   --override_device <device>
       Override device-specific asserts. Can be a comma-separated list.
 
+  --alt_boot_script <file>
+      expect the following python to inject the boot.img or special
+      logic for installing boot.img into the system
+
+      The scripts environment will have two modules pre-loaded:
+         common, edify_generator
+
+      The script must define the function:
+         make_boot_install(script,boot_img,input_zip,output_zip)
 """
 
 import sys
 
-if sys.hexversion < 0x02040000:
-  print >> sys.stderr, "Python 2.4 or newer is required."
+if sys.hexversion < 0x02050000:
+  print >> sys.stderr, "Python 2.5 or newer is required."
   sys.exit(1)
 
 import copy
@@ -79,7 +88,6 @@ import os
 import re
 import subprocess
 import tempfile
-import threading
 import time
 import zipfile
 
@@ -88,10 +96,7 @@ import amend_generator
 import edify_generator
 import both_generator
 
-if sys.version_info < (2,5):
-  import sha
-else:
-  import hashlib
+import hashlib
 
 OPTIONS = common.OPTIONS
 OPTIONS.package_key = "build/target/product/security/testkey"
@@ -107,6 +112,7 @@ OPTIONS.worker_threads = 3
 OPTIONS.backuptool = False
 OPTIONS.no_recovery = False
 OPTIONS.no_kernel = False
+OPTIONS.alt_boot_script = None
 OPTIONS.override_device = 'auto'
 
 def MostPopularKey(d, default):
@@ -343,7 +349,7 @@ def MakeRecoveryPatch(output_zip, recovery_img, boot_img):
   executable.
   """
 
-  d = Difference(recovery_img, boot_img)
+  d = common.Difference(recovery_img, boot_img)
   _, _, patch = d.ComputePatch()
   if OPTIONS.no_recovery == False:
     common.ZipWriteStr(output_zip, "recovery/recovery-from-boot.p", patch)
@@ -353,10 +359,7 @@ def MakeRecoveryPatch(output_zip, recovery_img, boot_img):
   # we check to see if this recovery has already been installed by
   # testing just the first 2k.
   HEADER_SIZE = 2048
-  if sys.version_info < (2,5):
-    header_sha1 = sha.sha(recovery_img.data[:HEADER_SIZE]).hexdigest()
-  else:
-    header_sha1 = hashlib.sha1(recovery_img.data[:HEADER_SIZE]).hexdigest()
+  header_sha1 = hashlib.sha1(recovery_img.data[:HEADER_SIZE]).hexdigest()
   sh = """#!/system/bin/sh
 if ! applypatch -c MTD:recovery:%(header_size)d:%(header_sha1)s; then
   log -t recovery "Installing new recovery image"
@@ -393,7 +396,7 @@ def WriteFullOTAPackage(input_zip, output_zip):
   modver = GetBuildProp("ro.modversion", input_zip)
   if modver is not None:
     metadata.update({"modver": modver})
-    script.Print("Welcome to %(modver)s!" % metadata)
+    script.Print("%(modver)s" % metadata)
 
   device_specific = common.DeviceSpecificParams(
     input_zip=input_zip,
@@ -428,11 +431,18 @@ def WriteFullOTAPackage(input_zip, output_zip):
   symlinks = CopySystemFiles(input_zip, output_zip)
   script.MakeSymlinks(symlinks)
 
+  if OPTIONS.backuptool:
+      script.ShowProgress(0.2, 10)
+      script.RunBackup("restore")
+
+  script.RunVerifyCachePartitionSize()
+  script.ShowProgress(0.2, 10)
+
   if not OPTIONS.no_kernel:
-    boot_img = File("boot.img", common.BuildBootableImage(
+    boot_img = common.File("boot.img", common.BuildBootableImage(
         os.path.join(OPTIONS.input_tmp, "BOOT")))
   if not OPTIONS.no_recovery:
-    recovery_img = File("recovery.img", common.BuildBootableImage(
+    recovery_img = common.File("recovery.img", common.BuildBootableImage(
         os.path.join(OPTIONS.input_tmp, "RECOVERY")))
     if not OPTIONS.no_kernel:
       MakeRecoveryPatch(output_zip, recovery_img, boot_img)
@@ -440,22 +450,16 @@ def WriteFullOTAPackage(input_zip, output_zip):
   Item.GetMetadata(input_zip)
   Item.Get("system").SetPermissions(script)
 
-  if not OPTIONS.no_kernel:
-    common.CheckSize(boot_img.data, "boot.img")
-    common.ZipWriteStr(output_zip, "boot.img", boot_img.data)
-  script.ShowProgress(0.2, 0)
+  if (OPTIONS.alt_boot_script is not None):
+      alt_global = dict()
+      alt_global['common'] = common
+      alt_global['edify_generator'] = edify_generator
+      alt_local = dict()
+      # load module
+      exec(OPTIONS.alt_boot_script, alt_global)
+      # run make_boot_install()
+      alt_global['make_boot_install'](script,boot_img,input_zip,output_zip)
 
-  if OPTIONS.backuptool:
-    script.ShowProgress(0.2, 10)
-    script.RunBackup("restore")
-
-  script.ShowProgress(0.2, 10)
-  if not OPTIONS.no_kernel:
-    script.RunVerifyCachePartitionSize()
-
-  script.ShowProgress(0.2, 10)
-  if not OPTIONS.no_kernel:
-    script.WriteRawImage("boot", "boot.img")
 
   script.ShowProgress(0.1, 0)
   device_specific.FullOTA_InstallEnd()
@@ -474,26 +478,6 @@ def WriteMetadata(metadata, output_zip):
                               for kv in sorted(metadata.iteritems())]))
 
 
-class File(object):
-  def __init__(self, name, data):
-    self.name = name
-    self.data = data
-    self.size = len(data)
-    if sys.version_info < (2,5):
-      self.sha1 = sha.sha(data).hexdigest()
-    else:
-      self.sha1 = hashlib.sha1(data).hexdigest()
-
-  def WriteToTemp(self):
-    t = tempfile.NamedTemporaryFile()
-    t.write(self.data)
-    t.flush()
-    return t
-
-  def AddToZip(self, z):
-    common.ZipWriteStr(z, self.name, self.data)
-
-
 def LoadSystemFiles(z):
   """Load all the files from SYSTEM/... in a given target-files
   ZipFile, and return a dict of {filename: File object}."""
@@ -502,115 +486,8 @@ def LoadSystemFiles(z):
     if info.filename.startswith("SYSTEM/") and not IsSymlink(info):
       fn = "system/" + info.filename[7:]
       data = z.read(info.filename)
-      out[fn] = File(fn, data)
+      out[fn] = common.File(fn, data)
   return out
-
-
-DIFF_PROGRAM_BY_EXT = {
-    ".gz" : "imgdiff",
-    ".zip" : ["imgdiff", "-z"],
-    ".jar" : ["imgdiff", "-z"],
-    ".apk" : ["imgdiff", "-z"],
-    ".img" : "imgdiff",
-    }
-
-
-class Difference(object):
-  def __init__(self, tf, sf):
-    self.tf = tf
-    self.sf = sf
-    self.patch = None
-
-  def ComputePatch(self):
-    """Compute the patch (as a string of data) needed to turn sf into
-    tf.  Returns the same tuple as GetPatch()."""
-
-    tf = self.tf
-    sf = self.sf
-
-    ext = os.path.splitext(tf.name)[1]
-    diff_program = DIFF_PROGRAM_BY_EXT.get(ext, "bsdiff")
-
-    ttemp = tf.WriteToTemp()
-    stemp = sf.WriteToTemp()
-
-    ext = os.path.splitext(tf.name)[1]
-
-    try:
-      ptemp = tempfile.NamedTemporaryFile()
-      if isinstance(diff_program, list):
-        cmd = copy.copy(diff_program)
-      else:
-        cmd = [diff_program]
-      cmd.append(stemp.name)
-      cmd.append(ttemp.name)
-      cmd.append(ptemp.name)
-      p = common.Run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-      _, err = p.communicate()
-      if err or p.returncode != 0:
-        print "WARNING: failure running %s:\n%s\n" % (diff_program, err)
-        return None
-      diff = ptemp.read()
-    finally:
-      ptemp.close()
-      stemp.close()
-      ttemp.close()
-
-    self.patch = diff
-    return self.tf, self.sf, self.patch
-
-
-  def GetPatch(self):
-    """Return a tuple (target_file, source_file, patch_data).
-    patch_data may be None if ComputePatch hasn't been called, or if
-    computing the patch failed."""
-    return self.tf, self.sf, self.patch
-
-
-def ComputeDifferences(diffs):
-  """Call ComputePatch on all the Difference objects in 'diffs'."""
-  print len(diffs), "diffs to compute"
-
-  # Do the largest files first, to try and reduce the long-pole effect.
-  by_size = [(i.tf.size, i) for i in diffs]
-  by_size.sort(reverse=True)
-  by_size = [i[1] for i in by_size]
-
-  lock = threading.Lock()
-  diff_iter = iter(by_size)   # accessed under lock
-
-  def worker():
-    try:
-      lock.acquire()
-      for d in diff_iter:
-        lock.release()
-        start = time.time()
-        d.ComputePatch()
-        dur = time.time() - start
-        lock.acquire()
-
-        tf, sf, patch = d.GetPatch()
-        if sf.name == tf.name:
-          name = tf.name
-        else:
-          name = "%s (%s)" % (tf.name, sf.name)
-        if patch is None:
-          print "patching failed!                                  %s" % (name,)
-        else:
-          print "%8.2f sec %8d / %8d bytes (%6.2f%%) %s" % (
-              dur, len(patch), tf.size, 100.0 * len(patch) / tf.size, name)
-      lock.release()
-    except Exception, e:
-      print e
-      raise
-
-  # start worker threads; wait for them all to finish.
-  threads = [threading.Thread(target=worker)
-             for i in range(OPTIONS.worker_threads)]
-  for th in threads:
-    th.start()
-  while threads:
-    threads.pop().join()
 
 
 def GetBuildProp(property, z):
@@ -696,12 +573,12 @@ def WriteIncrementalOTAPackage(target_zip, source_zip, output_zip):
       verbatim_targets.append((fn, tf.size))
     elif tf.sha1 != sf.sha1:
       # File is different; consider sending as a patch
-      diffs.append(Difference(tf, sf))
+      diffs.append(common.Difference(tf, sf))
     else:
       # Target file identical to source.
       pass
 
-  ComputeDifferences(diffs)
+  common.ComputeDifferences(diffs)
 
   for diff in diffs:
     tf, sf, d = diff.GetPatch()
@@ -711,10 +588,7 @@ def WriteIncrementalOTAPackage(target_zip, source_zip, output_zip):
       verbatim_targets.append((tf.name, tf.size))
     else:
       common.ZipWriteStr(output_zip, "patch/" + tf.name + ".p", d)
-      if sys.version_info < (2,5):
-        patch_list.append((tf.name, tf, sf, tf.size, sha.sha(d).hexdigest()))
-      else:
-        patch_list.append((tf.name, tf, sf, tf.size, hashlib.sha1(d).hexdigest()))
+      patch_list.append((tf.name, tf, sf, tf.size, hashlib.sha1(d).hexdigest()))
       largest_source_size = max(largest_source_size, sf.size)
 
   source_fp = GetBuildProp("ro.build.fingerprint", source_zip)
@@ -725,18 +599,18 @@ def WriteIncrementalOTAPackage(target_zip, source_zip, output_zip):
   script.Mount("MTD", "system", "/system")
   script.AssertSomeFingerprint(source_fp, target_fp)
 
-  source_boot = File("/tmp/boot.img",
+  source_boot = common.File("/tmp/boot.img",
                      common.BuildBootableImage(
       os.path.join(OPTIONS.source_tmp, "BOOT")))
-  target_boot = File("/tmp/boot.img",
+  target_boot = common.File("/tmp/boot.img",
                      common.BuildBootableImage(
       os.path.join(OPTIONS.target_tmp, "BOOT")))
   updating_boot = (source_boot.data != target_boot.data)
 
-  source_recovery = File("system/recovery.img",
+  source_recovery = common.File("system/recovery.img",
                          common.BuildBootableImage(
       os.path.join(OPTIONS.source_tmp, "RECOVERY")))
-  target_recovery = File("system/recovery.img",
+  target_recovery = common.File("system/recovery.img",
                          common.BuildBootableImage(
       os.path.join(OPTIONS.target_tmp, "RECOVERY")))
   updating_recovery = (source_recovery.data != target_recovery.data)
@@ -764,7 +638,7 @@ def WriteIncrementalOTAPackage(target_zip, source_zip, output_zip):
     script.SetProgress(so_far / total_verify_size)
 
   if updating_boot:
-    d = Difference(target_boot, source_boot)
+    d = common.Difference(target_boot, source_boot)
     _, _, d = d.ComputePatch()
     print "boot      target: %d  source: %d  diff: %d" % (
         target_boot.size, source_boot.size, len(d))
@@ -917,6 +791,8 @@ def main(argv):
       OPTIONS.omit_prereq = bool(a.lower() == 'true')
     elif o in ("-e", "--extra_script"):
       OPTIONS.extra_script = a
+    elif o in ("--alt_boot_script"):
+      OPTIONS.alt_boot_script = a
     elif o in ("-m", "--script_mode"):
       OPTIONS.script_mode = a
     elif o in ("--worker_threads"):
@@ -946,6 +822,7 @@ def main(argv):
                                               "backup=",
                                               "no_recovery=",
                                               "no_kernel=",
+                                              "alt_boot_script=",
                                               "override_device="],
                              extra_option_handler=option_handler)
 
@@ -958,6 +835,9 @@ def main(argv):
 
   if OPTIONS.extra_script is not None:
     OPTIONS.extra_script = open(OPTIONS.extra_script).read()
+
+  if OPTIONS.alt_boot_script is not None:
+    OPTIONS.alt_boot_script = open(OPTIONS.alt_boot_script).read()
 
   if OPTIONS.no_kernel and not OPTIONS.no_recovery:
     raise ValueError('no_kernel requires no_recovery (mkbootimg limitation).')
