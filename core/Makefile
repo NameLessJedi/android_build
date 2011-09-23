@@ -4,7 +4,7 @@
 ifneq "" "$(filter eng.%,$(BUILD_NUMBER))"
   # BUILD_NUMBER has a timestamp in it, which means that
   # it will change every time.  Pick a stable value.
-  FILE_NAME_TAG := eng.$(USER)
+  FILE_NAME_TAG := $(TARGET_BUILD_VARIANT).$(USER)
 else
   FILE_NAME_TAG := $(BUILD_NUMBER)
 endif
@@ -1119,7 +1119,7 @@ $(INTERNAL_OTA_PACKAGE_TARGET): $(BUILT_TARGET_FILES_PACKAGE) $(OTATOOLS)
            --no_prereq=$(no_prereq) \
            --no_recovery=$(no_recovery) \
            --no_kernel=$(no_kernel) \
-	   --override_device=$(override_device) \
+           --override_device=$(override_device) \
            $(BUILT_TARGET_FILES_PACKAGE) $@
 
 .PHONY: otapackage bacon
@@ -1127,7 +1127,7 @@ otapackage: $(INTERNAL_OTA_PACKAGE_TARGET)
 bacon: otapackage
 	$(hide) \
 		WANT_SQUASHFS=$(WANT_SQUASHFS) \
-		./vendor/cyanogen/tools/squisher
+		./vendor/nlj/tools/squisher
 
 endif    # TARGET_DEVICE != generic
 endif    # TARGET_PRODUCT != sdk
