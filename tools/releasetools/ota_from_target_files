@@ -435,9 +435,6 @@ def WriteFullOTAPackage(input_zip, output_zip):
       script.ShowProgress(0.2, 10)
       script.RunBackup("restore")
 
-  script.RunVerifyCachePartitionSize()
-  script.ShowProgress(0.2, 10)
-
   if not OPTIONS.no_kernel:
     boot_img = common.File("boot.img", common.BuildBootableImage(
         os.path.join(OPTIONS.input_tmp, "BOOT")))
